@@ -1,328 +1,267 @@
 
-import { useEffect, useRef, useState } from 'react'
-import { Client } from '@stomp/stompjs'
+import { useEffect, useRef, useState } from "react";
+import { Client } from "@stomp/stompjs";
 import {
   MapContainer,
   TileLayer,
   Marker,
-  Popup,
-  useMap
-} from 'react-leaflet'
-import 'leaflet/dist/leaflet.css'
-import './App.css'
+  Popup
+} from "react-leaflet";
+import "leaflet/dist/leaflet.css";
 
-function MapUpdater({ position }) {
-  const map = useMap()
+const WS_URL =
+  import.meta.env.VITE_WS_URL ||
+  "wss://live-tracker-backend-1.onrender.com/ws";
 
-  useEffect(() => {
-    map.setView(position, map.getZoom())
-  }, [map, position])
+export default function App() {
+  const [sessionId, setSessionId] = useState(
+    () => new URLSearchParams(window.location.search).get("session") || ""
+  );
+  const [location, setLocation] = useState(null);
+  const [status, setStatus] = useState("Create a session or open a shared link.");
+  const [sharing, setSharing] = useState(false);
+  const [connected, setConnected] = useState(false);
 
-  return null
-}
+  const clientRef = useRef(null);
+  const watchRef = useRef(null);
 
-function App() {
-  const [sessionCode, setSessionCode] = useState('')
-  const [status, setStatus] = useState('Ready')
-  const [myPosition, setMyPosition] = useState(null)
-  const [sharedPosition, setSharedPosition] = useState(null)
-  const [isSharing, setIsSharing] = useState(false)
-  const [isConnected, setIsConnected] = useState(false)
-
-  const clientRef = useRef(null)
-  const watchIdRef = useRef(null)
-  const latestLocationRef = useRef(null)
+  const shareLink = sessionId
+    ? `${window.location.origin}/?session=${encodeURIComponent(sessionId)}`
+    : "";
 
   function createSession() {
-    if (isSharing) {
-      setStatus('Stop the current sharing session before creating another.')
-      return
-    }
+    const id = crypto.randomUUID();
+    setSessionId(id);
+    setLocation(null);
 
-    const code = crypto.randomUUID()
-    setSessionCode(code)
-    setSharedPosition(null)
-    setStatus('Session created. Start sharing when you are ready.')
+    const url = new URL(window.location.href);
+    url.searchParams.set("session", id);
+    window.history.pushState({}, "", url);
+
+    setStatus("Session created. Copy the link and share it.");
   }
 
-  function connectToSession(code, onConnected) {
-    if (clientRef.current) {
-      clientRef.current.deactivate()
-      clientRef.current = null
+  async function copyLink() {
+    try {
+      await navigator.clipboard.writeText(shareLink);
+      setStatus("Share link copied. Send it to the other person.");
+    } catch {
+      setStatus("Copy failed. Select and copy the link manually.");
+    }
+  }
+
+  function connectToSession(shouldShare) {
+    if (!sessionId) {
+      setStatus("Create or open a session link first.");
+      return;
     }
 
-    setIsConnected(false)
+    if (clientRef.current) {
+      setStatus("Already connected to this session.");
+      return;
+    }
 
     const client = new Client({
-      brokerURL:
-  import.meta.env.VITE_WS_URL ||
-  'wss://live-tracker-backend-1.onrender.com/ws',
+      brokerURL: WS_URL,
       reconnectDelay: 3000,
 
       onConnect: () => {
-        setIsConnected(true)
-        setStatus(`Connected to session ${code}`)
+        setConnected(true);
+        setStatus(
+          shouldShare
+            ? "Connected. Waiting for GPS location..."
+            : "Connected. Waiting for the sharer's location..."
+        );
 
-        client.subscribe(`/topic/location/${code}`, (message) => {
+        client.subscribe(`/topic/location/${sessionId}`, (message) => {
           try {
-            const location = JSON.parse(message.body)
+            const data = JSON.parse(message.body);
+            const lat = Number(data.latitude);
+            const lng = Number(data.longitude);
 
-            setSharedPosition([
-              location.latitude,
-              location.longitude
-            ])
+            if (
+              Number.isFinite(lat) &&
+              Number.isFinite(lng) &&
+              lat >= -90 && lat <= 90 &&
+              lng >= -180 && lng <= 180
+            ) {
+              setLocation({ latitude: lat, longitude: lng });
+              setStatus("Location received.");
+            }
           } catch {
-            setStatus('Received an invalid location message.')
+            console.error("Invalid location message.");
           }
-        })
+        });
 
-        if (onConnected) {
-          onConnected(client)
+        if (shouldShare) {
+          watchRef.current = navigator.geolocation.watchPosition(
+            (result) => {
+              const coords = result.coords;
+              const nextLocation = {
+                latitude: coords.latitude,
+                longitude: coords.longitude,
+                timestamp: Date.now()
+              };
+
+              setLocation(nextLocation);
+
+              client.publish({
+                destination: `/app/location/${sessionId}`,
+                body: JSON.stringify(nextLocation)
+              });
+
+              setStatus("You are sharing your location.");
+            },
+            (error) => {
+              setStatus(`GPS error: ${error.message}`);
+            },
+            {
+              enableHighAccuracy: true,
+              maximumAge: 3000,
+              timeout: 15000
+            }
+          );
+
+          setSharing(true);
         }
       },
 
       onStompError: () => {
-        setStatus('WebSocket error. Check your backend.')
+        setStatus("Server error. Check the Spring Boot backend.");
       },
 
       onWebSocketError: () => {
-        
-setStatus('Cannot connect to the WebSocket backend. Check the URL and backend status.')
+        setStatus("Connection failed. Please try again.");
       },
 
       onWebSocketClose: () => {
-        setIsConnected(false)
+        setConnected(false);
       }
-    })
+    });
 
-    clientRef.current = client
-    client.activate()
+    clientRef.current = client;
+    client.activate();
   }
 
   function startSharing() {
-    if (!sessionCode.trim()) {
-      setStatus('Create a session first.')
-      return
-    }
-
     if (!navigator.geolocation) {
-      setStatus('Your browser does not support geolocation.')
-      return
+      setStatus("This browser does not support GPS location.");
+      return;
     }
 
-    if (isSharing) {
-      setStatus('Location sharing is already active.')
-      return
+    if (!window.isSecureContext) {
+      setStatus("Open the website using HTTPS to access GPS.");
+      return;
     }
 
-    setStatus('Requesting location permission...')
+    setStatus("Requesting location permission...");
 
     navigator.geolocation.getCurrentPosition(
-      (result) => {
-        const location = {
-          latitude: result.coords.latitude,
-          longitude: result.coords.longitude,
-          timestamp: Date.now()
-        }
-
-        latestLocationRef.current = location
-        setMyPosition([
-          location.latitude,
-          location.longitude
-        ])
-
-        setIsSharing(true)
-        setStatus('Location permission granted. Connecting...')
-
-        connectToSession(sessionCode.trim(), (client) => {
-          if (latestLocationRef.current) {
-            client.publish({
-              destination: `/app/location/${sessionCode.trim()}`,
-              body: JSON.stringify(latestLocationRef.current)
-            })
-          }
-        })
-
-        watchIdRef.current = navigator.geolocation.watchPosition(
-          (position) => {
-            const update = {
-              latitude: position.coords.latitude,
-              longitude: position.coords.longitude,
-              timestamp: Date.now()
-            }
-
-            latestLocationRef.current = update
-
-            setMyPosition([
-              update.latitude,
-              update.longitude
-            ])
-
-            const client = clientRef.current
-
-            if (client?.connected) {
-              client.publish({
-                destination: `/app/location/${sessionCode.trim()}`,
-                body: JSON.stringify(update)
-              })
-            }
-
-            setStatus('Sharing your location. Select Stop Sharing to end.')
-          },
-          (error) => {
-            setStatus(`Location error: ${error.message}`)
-          },
-          {
-            enableHighAccuracy: true,
-            maximumAge: 2000,
-            timeout: 15000
-          }
-        )
-      },
+      () => connectToSession(true),
       (error) => {
-        setStatus(`Location permission/error: ${error.message}`)
+        setStatus(
+          error.code === 1
+            ? "Permission denied. Allow location access in browser settings."
+            : "Unable to get GPS location. Check Location Services and retry."
+        );
       },
-      {
-        enableHighAccuracy: true,
-        timeout: 15000,
-        maximumAge: 0
-      }
-    )
-  }
-
-  function joinSession() {
-    const code = sessionCode.trim()
-
-    if (!code) {
-      setStatus('Enter the session code first.')
-      return
-    }
-
-    if (isSharing) {
-      setStatus('Stop your current sharing session before joining another.')
-      return
-    }
-
-    setSharedPosition(null)
-    setStatus('Connecting to the session...')
-
-    connectToSession(code)
+      { enableHighAccuracy: true, timeout: 15000 }
+    );
   }
 
   function stopSharing() {
-    if (watchIdRef.current !== null) {
-      navigator.geolocation.clearWatch(watchIdRef.current)
-      watchIdRef.current = null
+    if (watchRef.current !== null) {
+      navigator.geolocation.clearWatch(watchRef.current);
+      watchRef.current = null;
     }
 
-    latestLocationRef.current = null
-    setIsSharing(false)
+    const client = clientRef.current;
+    clientRef.current = null;
 
-    if (clientRef.current) {
-      clientRef.current.deactivate()
-      clientRef.current = null
-    }
+    if (client) client.deactivate();
 
-    setIsConnected(false)
-    setStatus('Sharing stopped. You are disconnected.')
+    setSharing(false);
+    setConnected(false);
+    setStatus("Sharing stopped. Rejoin to view updates again.");
   }
 
   useEffect(() => {
     return () => {
-      if (watchIdRef.current !== null) {
-        navigator.geolocation.clearWatch(watchIdRef.current)
+      if (watchRef.current !== null) {
+        navigator.geolocation.clearWatch(watchRef.current);
       }
 
       if (clientRef.current) {
-        clientRef.current.deactivate()
+        clientRef.current.deactivate();
       }
-    }
-  }, [])
-
-  const mapCenter =
-    sharedPosition || myPosition || [13.0827, 80.2707]
+    };
+  }, []);
 
   return (
-    <main className="container">
+    <main style={{ maxWidth: 900, margin: "24px auto", padding: 16 }}>
       <h1>Live Location Tracker</h1>
-      <p>Share your location only with people you trust.</p>
 
-      <section className="panel">
-        <h2>Share My Location</h2>
+      <p>
+        Location sharing requires the other person's permission.
+        They can stop sharing at any time.
+      </p>
 
-        <button onClick={createSession} disabled={isSharing}>
-          Create Session
-        </button>
+      {!sessionId ? (
+        <button onClick={createSession}>Create Session</button>
+      ) : (
+        <>
+          <p><strong>Session code:</strong> {sessionId}</p>
 
-        {sessionCode && (
-          <p className="code">
-            Session code: <strong>{sessionCode}</strong>
-            <button
-              onClick={() => navigator.clipboard.writeText(sessionCode)}
-            >
-              Copy Code
-            </button>
-          </p>
-        )}
+          <label htmlFor="share-link">Share this link:</label>
+          <input
+            id="share-link"
+            value={shareLink}
+            readOnly
+            style={{ display: "block", width: "100%", padding: 10, margin: "8px 0" }}
+          />
 
-        <button onClick={startSharing} disabled={isSharing || !sessionCode}>
-          Start Sharing My Location
-        </button>
+          <button onClick={copyLink}>Copy Link</button>
 
-        {isSharing && (
-          <button onClick={stopSharing}>
-            Stop Sharing
-          </button>
-        )}
-      </section>
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap", marginTop: 16 }}>
+            {!connected && !sharing && (
+              <button onClick={() => connectToSession(false)}>
+                View Shared Location
+              </button>
+            )}
 
-      <section className="panel">
-        <h2>View Shared Location</h2>
+            {!sharing && (
+              <button onClick={startSharing}>
+                Start Sharing My Location
+              </button>
+            )}
 
-        <input
-          value={sessionCode}
-          onChange={(event) => setSessionCode(event.target.value)}
-          placeholder="Enter session code"
-          disabled={isSharing}
-        />
+            {sharing && (
+              <button onClick={stopSharing}>
+                Stop Sharing
+              </button>
+            )}
+          </div>
+        </>
+      )}
 
-        <button onClick={joinSession} disabled={isSharing}>
-          Join Session
-        </button>
-      </section>
+      <p role="status">{status}</p>
 
-      <section className="panel">
-        <h2>Status</h2>
-        <p>{status}</p>
-        <p>WebSocket: {isConnected ? 'Connected' : 'Disconnected'}</p>
-
+      {location && (
         <MapContainer
-          center={mapCenter}
-          zoom={13}
-          style={{ height: '350px', width: '100%' }}
+          center={[location.latitude, location.longitude]}
+          zoom={16}
+          style={{ height: 450, width: "100%", marginTop: 20 }}
         >
-          <MapUpdater position={mapCenter} />
-
           <TileLayer
-            attribution='&copy; OpenStreetMap contributors'
+            attribution="&copy; OpenStreetMap contributors"
             url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
           />
 
-          {myPosition && (
-            <Marker position={myPosition}>
-              <Popup>My current location</Popup>
-            </Marker>
-          )}
-
-          {sharedPosition && (
-            <Marker position={sharedPosition}>
-              <Popup>Received shared location</Popup>
-            </Marker>
-          )}
+          <Marker position={[location.latitude, location.longitude]}>
+            <Popup>Latest shared location</Popup>
+          </Marker>
         </MapContainer>
-      </section>
+      )}
     </main>
-  )
+  );
 }
-
-export default App
