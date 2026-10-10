@@ -56,7 +56,7 @@ function App() {
     const client = new Client({
       brokerURL:
   import.meta.env.VITE_WS_URL ||
-  'ws://localhost:8080/ws',
+  'wss://live-tracker-backend-1.onrender.com/ws',
       reconnectDelay: 3000,
 
       onConnect: () => {
